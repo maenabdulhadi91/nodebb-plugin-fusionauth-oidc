@@ -6,6 +6,8 @@
 	const db = require.main.require('./src/database');
 	const authenticationController = require.main.require('./src/controllers/authentication');
 	const Settings = require.main.require('./src/settings');
+	const privileges = require.main.require('./src/privileges');
+
 
 	const async = require('async');
 	const { PassportOIDC } = require('./src/passport-fusionauth-oidc');
@@ -85,14 +87,27 @@
 
 			// If you call this twice it will overwrite the first.
 			passport.use(constants.name, new PassportOIDC(settings, (req, accessToken, refreshToken, profile, callback) => {
-				const email = profile[settings.emailClaim || 'email'];
-				const isAdmin = settings.rolesClaim ? (profile[settings.rolesClaim] === 'admin' || (profile[settings.rolesClaim].some && profile[settings.rolesClaim].some((value) => value === 'admin'))) : false;
+				const email = profile['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier'];//profile[settings.emailClaim || 'email'];
+				let isAdmin = false;
+				// Tahaluf Start Block
+				if(profile[settings.rolesClaim] != undefined){
+					isAdmin = settings.rolesClaim ? (profile[settings.rolesClaim] === 'System_Admin') : false; //|| (profile[settings.rolesClaim].some && profile[settings.rolesClaim].some((value) => value === 'System_Admin')) : false;
+				} 
+				else 
+				{
+					return callback(new Error('This User Not Related To Any Group !'));
+				}
+
+				// Tahaluf End Block
+
 				Oidc.login({
 					oAuthid: profile.sub,
-					username: profile.preferred_username || email.split('@')[0],
+					username: email.split('@')[0],//profile.preferred_username || email.split('@')[0],
 					email: email,
 					rolesEnabled: settings.rolesClaim && settings.rolesClaim.length !== 0,
 					isAdmin: isAdmin,
+					groupName:profile[settings.rolesClaim],
+					permissions : profile.Permission === undefined ? [] : profile.Permission ,
 				}, (err, user) => {
 					if (err) {
 						return callback(err);
@@ -118,6 +133,7 @@
 		});
 	};
 
+	
 	Oidc.login = function (payload, callback) {
 		async.waterfall([
 			// Lookup user by existing oauthid
@@ -125,8 +141,31 @@
 			// Skip if we found the user in the pevious step or create the user
 			function (uid, callback) {
 				if (uid !== null) {
-					// Existing user
+
+			async.waterfall([
+				(callback) => Oidc.getUidByOAuthid(payload.oAuthid, callback),
+				function (uid, callback) {
+					if (uid > 0) {
+						prepareGroup({
+							groupName: payload.groupName,
+							userId : uid,
+						}, callback);
+					} else {
 					callback(null, uid);
+					}
+				},
+				function (uid, callback) {
+					if (payload.groupName != '') {
+						giveDefaultPrivileges({
+							groupName: payload.groupName,
+							userId : uid,
+						}, callback);
+					} else {
+						callback(null, uid); 
+					}
+				},
+			], callback);
+
 				} else {
 					// New User
 					if (!payload.email) {
@@ -151,6 +190,26 @@
 							db.setObjectField(constants.name + 'Id:uid', payload.oAuthid, uid);
 
 							callback(null, uid);
+						},
+						function (uid, callback) {
+							if (uid > 0) {
+								prepareGroup({
+									groupName: payload.groupName,
+									userId : uid,
+								}, callback);
+							} else {
+								callback(null, uid); // Existing account -- merge
+							}
+						},
+						function (uid, callback) {
+							if (payload.groupName != '') {
+								giveDefaultPrivileges({
+									groupName: payload.groupName,
+									userId : uid,
+								}, callback);
+							} else {
+								callback(null, uid); // Existing account -- merge
+							}
 						},
 					], callback);
 				}
@@ -188,6 +247,98 @@
 			});
 		});
 	};
+
+	async function prepareGroup(data, callback) {
+		const allSystemGroups = await db.getSortedSetRange('groups:createtime', 0, -1);
+		const exists = await Groups.exists(data.groupName);
+
+		if (exists) {
+			const isMember = await Groups.isMember(data.userId, data.groupName); // to be used if needed
+
+			await Promise.all([
+				Groups.leave(allSystemGroups, data.userId),
+				//giveDefaultPrivileges(data.groupName),
+			]);
+			await callback(null, data.userId);
+		} else {
+			await Groups.create({
+				name: data.groupName,
+				userTitle: data.groupName,
+				description: 'Forum wide members of ' + data.groupName,
+				hidden: 0,
+				private: 1,
+				disableJoinRequests: 1,
+			});
+			await Promise.all([
+				Groups.leave(allSystemGroups, data.userId),
+				Groups.join(data.groupName, data.userId),
+				//giveDefaultPrivileges(data.groupName, data.permissions, data.userId),
+			]);
+			await callback(null, data.userId);
+		}
+	}
+
+	async function giveDefaultPrivileges(group, callback) {
+
+		let data = '';
+		let permisstions = [];
+		let resArray = [];
+
+		const https = require('https')
+		const options = {
+			hostname: 'events.tahaluf.ae',
+			port: 443,
+			path: '/SecurityAPi/api/security/group/' + group.groupName + '/permissions',
+			method: 'GET',
+			async:true,
+			headers: {
+				'ApiKey': 'VVuUND0qDNW0MTosWVl8DM2XZrK5DLNnnldBwvcsXv8=9c28ba29-abd0-49af-acaa-180ef90c922b',
+				'AccountCode': 'NHP',
+			}
+		}
+		const req = https.request(options, res => {
+			console.log(`statusCode: ${res.statusCode}`);
+
+			res.on('data', function (items) {
+				data += items;
+			});
+
+			res.on('end', async function () {
+				resArray = JSON.parse(data);
+				resArray.forEach(item => permisstions.push(item.code));
+				if (permisstions.length > 0) {
+					await privileges.global.give(permisstions, group.groupName);
+					await Groups.join(group.groupName, group.userId),
+					await callback(null, group.userId);
+				}
+			});
+		})
+
+		req.on('error', error => {
+			console.error(error)
+		})
+
+		
+
+		req.end();
+
+		/*
+		let defaultPrivileges = permissions;
+
+		if(defaultPrivileges.length == 0){
+			
+			await Groups.join('verified-users' , userId);
+
+			defaultPrivileges = [
+				'groups:chat', 'groups:upload:post:image', 'groups:signature', 'groups:search:content',
+				'groups:search:users', 'groups:search:tags', 'groups:view:users', 'groups:view:tags', 'groups:view:groups',
+				'groups:local:login',
+			];
+		}
+		
+		await privileges.global.give(defaultPrivileges, groupName);
+		*/
+	}
 
 	Oidc.getUidByOAuthid = function (oAuthid, callback) {
 		db.getObjectField(constants.name + 'Id:uid', oAuthid, (err, uid) => {
